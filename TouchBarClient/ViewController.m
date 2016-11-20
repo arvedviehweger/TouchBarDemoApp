@@ -47,7 +47,6 @@ static const NSTimeInterval kAnimationDuration = 0.3;
 
 @property (nonatomic, strong) IBOutlet NSLayoutConstraint *demoImageAspectRatioConstraint;
 @property (nonatomic, strong) IBOutlet NSLayoutConstraint *touchBarAspectRatioConstraint;
-@property (nonatomic, strong) IBOutlet NSLayoutConstraint *keyboardAspectRatioConstraint;
 
 @property (nonatomic, readonly) BOOL active;
 @property (nonatomic, assign) OperatingMode mode;
@@ -69,6 +68,8 @@ static const NSTimeInterval kAnimationDuration = 0.3;
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    
+    _keyboardView.delegate = self;
     
     _demoParameters = @[
                        @{
@@ -154,6 +155,15 @@ static const NSTimeInterval kAnimationDuration = 0.3;
         [_peerChannel close];
         _peerChannel = nil;
     }
+    
+    [self resetSession];
+}
+
+- (void)resetSession {
+    _peerChannel = nil;
+    _serverVersion = nil;
+    _touchBarReady = NO;
+    _keyboardReady = NO;
 }
 
 - (IBAction)recognizerFired:(UIGestureRecognizer*)recognizer {
@@ -174,6 +184,11 @@ static const NSTimeInterval kAnimationDuration = 0.3;
     // Hardcoded '2', because the touch bar is rendered @2x
     CGFloat scale = 2 * _touchBarView.frame.size.width / _touchBarView.image.size.width;
     CGPoint location = [recognizer locationInView:_touchBarView];
+    if (location.x < 0) {
+        location.x = 0;
+    } else if (location.x >= _touchBarView.bounds.size.width) {
+        location.x = _touchBarView.bounds.size.width - 1;
+    }
 
     event.x = location.x / scale;
     event.y = location.y / scale;
@@ -193,9 +208,9 @@ static const NSTimeInterval kAnimationDuration = 0.3;
 
 - (BOOL)active {
     return !!_peerChannel
-    && _serverVersion.unsignedLongLongValue <= kServerVersion
-    && _touchBarReady
-    && (_keyboardReady || _mode == OperatingModeTouchBarOnly);
+        && (!_serverVersion || _serverVersion.unsignedLongLongValue == kServerVersion)
+        && _touchBarReady
+        && (_keyboardReady || _mode == OperatingModeTouchBarOnly);
 }
 
 - (void)setAlign:(Alignment)align {
@@ -260,9 +275,13 @@ static const NSTimeInterval kAnimationDuration = 0.3;
     UIImage *demoImage = nil;
     
     if (!_peerChannel) {
-        _infoLabelView.text = @"Please connect this device to your Mac and start TouchBarServer...";
-    } else if (_serverVersion.unsignedLongLongValue > kServerVersion) {
-        _infoLabelView.text = @"🚫 Connected to incompatible TouchBarServer version!\n\nPlease build & install the latest TouchBarClient on this device.";
+        _infoLabelView.text = @"Please connect this device to your Mac and start TouchBarServer.";
+    } else if (_serverVersion && _serverVersion.unsignedLongLongValue != kServerVersion) {
+        if (_serverVersion.unsignedLongLongValue < kServerVersion) {
+            _infoLabelView.text = @"🚫 Connected to older, incompatible TouchBarServer version!\n\nPlease build & install the latest TouchBarServer on your Mac.";
+        } else {
+            _infoLabelView.text = @"🚫 Connected to newer, incompatible TouchBarServer version!\n\nPlease build & install the latest TouchBarClient on this device.";
+        }
     } else {
         _infoLabelView.text = @"";
     }
@@ -461,13 +480,15 @@ static const NSTimeInterval kAnimationDuration = 0.3;
 - (NSArray *)stickKeyboardToPanelConstraints {
     NSMutableArray *constraints = [NSMutableArray new];
 
+    CGFloat margin = 1.0;
+    
     [constraints addObject:[NSLayoutConstraint constraintWithItem:_keyboardView
                                                         attribute:NSLayoutAttributeLeft
                                                         relatedBy:NSLayoutRelationEqual
                                                            toItem:_panelView
                                                         attribute:NSLayoutAttributeLeft
                                                        multiplier:1.0
-                                                         constant:2.0]];
+                                                         constant:margin]];
 
     [constraints addObject:[NSLayoutConstraint constraintWithItem:_keyboardView
                                                         attribute:NSLayoutAttributeRight
@@ -475,7 +496,7 @@ static const NSTimeInterval kAnimationDuration = 0.3;
                                                            toItem:_panelView
                                                         attribute:NSLayoutAttributeRight
                                                        multiplier:1.0
-                                                         constant:-2.0]];
+                                                         constant:-margin]];
 
     [constraints addObject:[NSLayoutConstraint constraintWithItem:_keyboardView
                                                         attribute:NSLayoutAttributeTop
@@ -483,7 +504,7 @@ static const NSTimeInterval kAnimationDuration = 0.3;
                                                            toItem:_panelView
                                                         attribute:NSLayoutAttributeTop
                                                        multiplier:1.0
-                                                         constant:0.0]];
+                                                         constant:margin]];
     
     [constraints addObject:[NSLayoutConstraint constraintWithItem:_keyboardView
                                                         attribute:NSLayoutAttributeBottom
@@ -491,7 +512,7 @@ static const NSTimeInterval kAnimationDuration = 0.3;
                                                            toItem:_panelView
                                                         attribute:NSLayoutAttributeBottom
                                                        multiplier:1.0
-                                                         constant:0.0]];
+                                                         constant:-margin]];
 
     return constraints;
 }
@@ -591,6 +612,11 @@ static const NSTimeInterval kAnimationDuration = 0.3;
 #pragma mark - PTChannelDelegate
 
 - (BOOL)ioFrameChannel:(PTChannel *)channel shouldAcceptFrameOfType:(uint32_t)type tag:(uint32_t)tag payloadSize:(uint32_t)payloadSize {
+    if (_serverVersion && _serverVersion.unsignedLongLongValue != kServerVersion) {
+        // Ignore messages from incompatible server
+        return NO;
+    }
+
     return type >= kProtocolFrameTypeServerMin && type <= kProtocolFrameTypeServerMax;
 }
 
@@ -599,8 +625,11 @@ static const NSTimeInterval kAnimationDuration = 0.3;
 
     switch (type) {
         case ProtocolFrameTypeServerVersion: {
-            Version *version = (Version *)payload.data;
-            _serverVersion = @(*version);
+            if (!_serverVersion) {
+                Version *version = (Version *)payload.data;
+                _serverVersion = @(*version);
+                [self updateViews:self.active];
+            }
         }
             
         case ProtocolFrameTypeServerImage: {
@@ -628,7 +657,15 @@ static const NSTimeInterval kAnimationDuration = 0.3;
             break;
         }
         case ProtocolFrameTypeServerKeyboardLayout: {
-            _keyboardView.htmlData = [NSData dataWithBytes:payload.data length:payload.length];
+            NSData *data = [NSData dataWithBytes:payload.data length:payload.length];
+            NSDictionary *layoutInfo = [NSKeyedUnarchiver unarchiveObjectWithData:data];
+            _keyboardView.layoutType = [layoutInfo[@"type"] integerValue];
+            _keyboardView.keyCaptions = layoutInfo[@"captions"];
+            if (!_keyboardReady) {
+                BOOL wasActive = self.active;
+                _keyboardReady = YES;
+                [self updateViews:wasActive || self.active];
+            }
             break;
         }
         case ProtocolFrameTypeServerSystemKeyEvent: {
@@ -659,9 +696,7 @@ static const NSTimeInterval kAnimationDuration = 0.3;
     if (channel == _peerChannel) {
         BOOL wasActive = self.active;
 
-        _peerChannel = nil;
-        _touchBarReady = NO;
-        _keyboardReady = NO;
+        [self resetSession];
 
         [self updateViews:wasActive || self.active];
     }
@@ -675,40 +710,14 @@ static const NSTimeInterval kAnimationDuration = 0.3;
 
     BOOL wasActive = self.active;
 
+    [self resetSession];
     _peerChannel = otherChannel;
     _peerChannel.userInfo = address;
-
-    _touchBarReady = NO;
-    _keyboardReady = NO;
 
     [self updateViews:wasActive || self.active];
 }
 
 #pragma mark - KeyboardViewDelegate
-
-- (void)keyboardViewDidLoad:(KeyboardView *)keyboardView {
-    CGFloat aspectRatio = keyboardView.aspectRatio.width / keyboardView.aspectRatio.height;
-    
-    // Apply a minor correction to the aspectRatio to make it fit perfectly on the demo image
-    aspectRatio *= 1.02;
-    
-    [_keyboardView removeConstraint:_keyboardAspectRatioConstraint];
-    _keyboardAspectRatioConstraint = [NSLayoutConstraint constraintWithItem:_keyboardAspectRatioConstraint.firstItem
-                                                          attribute:_keyboardAspectRatioConstraint.firstAttribute
-                                                          relatedBy:_keyboardAspectRatioConstraint.relation
-                                                             toItem:_keyboardAspectRatioConstraint.secondItem
-                                                          attribute:_keyboardAspectRatioConstraint.secondAttribute
-                                                         multiplier:aspectRatio
-                                                           constant:0.0];
-    [_keyboardView addConstraint:_keyboardAspectRatioConstraint];
-    [self.view layoutIfNeeded];
-    
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.5), dispatch_get_main_queue(), ^{
-        BOOL wasActive = self.active;
-        _keyboardReady = YES;
-        [self updateViews:wasActive || self.active];
-    });
-}
 
 - (void)keyboardView:(KeyboardView*)keyboardView keyEvent:(KeyEvent)keyEvent {
     if (!_peerChannel || _panelView.hidden || _keyboardView.hidden) return;
